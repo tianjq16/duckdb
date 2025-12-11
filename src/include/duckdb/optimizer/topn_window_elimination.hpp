@@ -37,16 +37,20 @@ public:
 	unique_ptr<LogicalOperator> Optimize(unique_ptr<LogicalOperator> op);
 
 private:
-	bool CanOptimize(LogicalOperator &op);
+	bool CanOptimize(LogicalOperator &op, idx_t &expr_idx);
 	unique_ptr<LogicalOperator> OptimizeInternal(unique_ptr<LogicalOperator> op, ColumnBindingReplacer &replacer);
+
+	vector<ColumnBinding> GetFilterColumnBindings(LogicalFilter &filter);
 
 	unique_ptr<LogicalOperator> CreateAggregateOperator(LogicalWindow &window, vector<unique_ptr<Expression>> args,
 	                                                    const TopNWindowEliminationParameters &params) const;
 	unique_ptr<LogicalOperator> TryCreateUnnestOperator(unique_ptr<LogicalOperator> op,
 	                                                    const TopNWindowEliminationParameters &params) const;
+	unique_ptr<LogicalOperator> TryCreateFilterOperator(unique_ptr<LogicalOperator> op,
+	                                                    const TopNWindowEliminationParameters &params) const;
 	unique_ptr<LogicalOperator> CreateProjectionOperator(unique_ptr<LogicalOperator> op,
 	                                                     const TopNWindowEliminationParameters &params,
-	                                                     const map<idx_t, idx_t> &group_idxs) const;
+	                                                     const map<idx_t, idx_t> &group_idxs);
 
 	vector<unique_ptr<Expression>> GenerateAggregatePayload(const vector<ColumnBinding> &bindings,
 	                                                        const LogicalWindow &window, map<idx_t, idx_t> &group_idxs);
@@ -61,9 +65,10 @@ private:
 	                                  const map<idx_t, idx_t> &group_idxs,
 	                                  const vector<ColumnBinding> &topmost_bindings,
 	                                  vector<ColumnBinding> &new_bindings, ColumnBindingReplacer &replacer);
-	TopNWindowEliminationParameters ExtractOptimizerParameters(const LogicalWindow &window, const LogicalFilter &filter,
+	TopNWindowEliminationParameters ExtractOptimizerParameters(const LogicalWindow &window, LogicalFilter &filter,
 	                                                           const vector<ColumnBinding> &bindings,
-	                                                           vector<unique_ptr<Expression>> &aggregate_payload);
+	                                                           vector<unique_ptr<Expression>> &aggregate_payload,
+	                                                           const idx_t &expr_idx, bool &modify_filter);
 
 	// Semi-join reduction methods
 	unique_ptr<LogicalOperator> TryPrepareLateMaterialization(const LogicalWindow &window,

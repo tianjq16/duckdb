@@ -4,9 +4,11 @@
 #include "duckdb/catalog/catalog_entry/scalar_macro_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/scalar_function_catalog_entry.hpp"
 #include "duckdb/optimizer/late_materialization_helper.hpp"
+#include "duckdb/optimizer/filter_pushdown.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
+#include "duckdb/planner/operator/logical_empty_result.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
@@ -136,12 +138,40 @@ unique_ptr<LogicalOperator> TopNWindowElimination::Optimize(unique_ptr<LogicalOp
 	if (!replacer.replacement_bindings.empty()) {
 		replacer.VisitOperator(*op);
 	}
+	FilterPushdown filter_pushdown(optimizer);
+	op = filter_pushdown.Rewrite(std::move(std::move(op)));
+	StatisticsPropagator propagator(optimizer, *op);
+	propagator.PropagateStatistics(op);
+	*stats = propagator.GetStatisticsMap();
 	return op;
+}
+
+vector<ColumnBinding> TopNWindowElimination::GetFilterColumnBindings(LogicalFilter &filter) {
+	auto bindings = filter.GetColumnBindings();
+	LogicalOperatorVisitor::EnumerateExpressions(filter, [&](unique_ptr<Expression> *expr) {
+		ExpressionIterator::EnumerateExpression(*expr, [&](unique_ptr<Expression> &child) {
+			if (child->type == ExpressionType::BOUND_COLUMN_REF) {
+				auto &column_ref = child->Cast<BoundColumnRefExpression>();
+				bool found = false;
+				for (const auto &binding : bindings) {
+					if (binding == column_ref.binding) {
+						found = true;
+					}
+				}
+				if (!found) {
+					bindings.push_back(column_ref.binding);
+				}
+			}
+		});
+	});
+
+	return bindings;
 }
 
 unique_ptr<LogicalOperator> TopNWindowElimination::OptimizeInternal(unique_ptr<LogicalOperator> op,
                                                                     ColumnBindingReplacer &replacer) {
-	if (!CanOptimize(*op)) {
+	idx_t expr_idx;
+	if (!CanOptimize(*op, expr_idx)) {
 		// Traverse through query plan to find grouped top-n pattern
 		if (op->children.size() > 1) {
 			// If an operator has multiple children, we do not want them to overwrite each other's stop operator.
@@ -169,7 +199,7 @@ unique_ptr<LogicalOperator> TopNWindowElimination::OptimizeInternal(unique_ptr<L
 	reference<LogicalOperator> child = *filter.children[0];
 
 	// Get bindings and types from filter to use in top-most operator later
-	const auto topmost_bindings = filter.GetColumnBindings();
+	auto topmost_bindings = GetFilterColumnBindings(filter);
 	auto new_bindings = TraverseProjectionBindings(topmost_bindings, child);
 
 	D_ASSERT(child.get().type == LogicalOperatorType::LOGICAL_WINDOW);
@@ -180,7 +210,14 @@ unique_ptr<LogicalOperator> TopNWindowElimination::OptimizeInternal(unique_ptr<L
 	// We use an ordered map here because we need to iterate over them in order later
 	map<idx_t, idx_t> group_projection_idxs;
 	auto aggregate_payload = GenerateAggregatePayload(new_bindings, window, group_projection_idxs);
-	auto params = ExtractOptimizerParameters(window, filter, new_bindings, aggregate_payload);
+
+	bool modify_filter = false;
+	auto params = ExtractOptimizerParameters(window, filter, new_bindings, aggregate_payload, expr_idx, modify_filter);
+
+	if (params.limit <= 0) {
+		return make_uniq<LogicalEmptyResult>(std::move(op));
+	}
+	params.include_row_number = true;
 
 	unique_ptr<LogicalOperator> late_mat_lhs = nullptr;
 	if (params.payload_type == TopNPayloadType::STRUCT_PACK) {
@@ -193,19 +230,22 @@ unique_ptr<LogicalOperator> TopNWindowElimination::OptimizeInternal(unique_ptr<L
 
 	// Optimize window children
 	window.children[0] = Optimize(std::move(window.children[0]));
-
-	op = CreateAggregateOperator(window, std::move(aggregate_payload), params);
-	op = TryCreateUnnestOperator(std::move(op), params);
-	op = CreateProjectionOperator(std::move(op), params, group_projection_idxs);
+	unique_ptr<LogicalOperator> new_child = CreateAggregateOperator(window, std::move(aggregate_payload), params);
+	new_child = TryCreateUnnestOperator(std::move(new_child), params);
+	new_child = CreateProjectionOperator(std::move(new_child), params, group_projection_idxs);
 
 	D_ASSERT(op->type != LogicalOperatorType::LOGICAL_UNNEST);
 
 	if (late_mat_lhs) {
-		op = ConstructJoin(std::move(late_mat_lhs), std::move(op), group_projection_idxs.size(), params);
+		new_child = ConstructJoin(std::move(late_mat_lhs), std::move(new_child), group_projection_idxs.size(), params);
 	}
 
-	UpdateTopmostBindings(window_idx, op, group_projection_idxs, topmost_bindings, new_bindings, replacer);
-	replacer.stop_operator = op.get();
+	UpdateTopmostBindings(window_idx, new_child, group_projection_idxs, topmost_bindings, new_bindings, replacer);
+	replacer.stop_operator = new_child.get();
+
+	filter.projection_map.clear();
+	filter.children.clear();
+	filter.AddChild(std::move(new_child));
 
 	RemoveUnusedColumns unused_optimizer(optimizer.binder, optimizer.context, true);
 	unused_optimizer.VisitOperator(*op);
@@ -398,7 +438,7 @@ void TopNWindowElimination::AddStructExtractExprs(
 unique_ptr<LogicalOperator>
 TopNWindowElimination::CreateProjectionOperator(unique_ptr<LogicalOperator> op,
                                                 const TopNWindowEliminationParameters &params,
-                                                const map<idx_t, idx_t> &group_idxs) const {
+                                                const map<idx_t, idx_t> &group_idxs) {
 	const auto aggregate_type = GetAggregateType(op);
 	const idx_t aggregate_table_idx = GetAggregateIdx(op);
 	const auto op_column_bindings = op->GetColumnBindings();
@@ -439,91 +479,92 @@ TopNWindowElimination::CreateProjectionOperator(unique_ptr<LogicalOperator> op,
 	return unique_ptr<LogicalOperator>(std::move(logical_projection));
 }
 
-bool TopNWindowElimination::CanOptimize(LogicalOperator &op) {
+bool TopNWindowElimination::CanOptimize(LogicalOperator &op, idx_t &expr_idx) {
 	if (op.type != LogicalOperatorType::LOGICAL_FILTER) {
 		return false;
 	}
 
 	const auto &filter = op.Cast<LogicalFilter>();
-	if (filter.expressions.size() != 1) {
-		return false;
-	}
 
-	if (filter.expressions[0]->type != ExpressionType::COMPARE_LESSTHANOREQUALTO) {
-		return false;
-	}
+	for (expr_idx = 0; expr_idx < filter.expressions.size(); expr_idx++) {
+		if (filter.expressions[expr_idx]->type != ExpressionType::COMPARE_LESSTHANOREQUALTO &&
+		    filter.expressions[expr_idx]->type != ExpressionType::COMPARE_LESSTHAN &&
+		    filter.expressions[expr_idx]->type != ExpressionType::COMPARE_EQUAL) {
+			continue;
+		}
 
-	auto &filter_comparison = filter.expressions[0]->Cast<BoundComparisonExpression>();
-	if (filter_comparison.right->type != ExpressionType::VALUE_CONSTANT) {
-		return false;
-	}
-	auto &filter_value = filter_comparison.right->Cast<BoundConstantExpression>();
-	if (filter_value.value.type() != LogicalType::BIGINT) {
-		return false;
-	}
-	if (filter_value.value.GetValue<int64_t>() < 1) {
-		return false;
-	}
+		auto &filter_comparison = filter.expressions[expr_idx]->Cast<BoundComparisonExpression>();
 
-	if (filter_comparison.left->type != ExpressionType::BOUND_COLUMN_REF) {
-		return false;
-	}
-	VisitExpression(&filter_comparison.left);
+		if (filter_comparison.right->type != ExpressionType::VALUE_CONSTANT) {
+			continue;
+		}
+		auto &filter_value = filter_comparison.right->Cast<BoundConstantExpression>();
+		if (filter_value.value.type() != LogicalType::BIGINT) {
+			continue;
+		}
 
-	reference<LogicalOperator> child = *filter.children[0];
-	while (child.get().type == LogicalOperatorType::LOGICAL_PROJECTION) {
-		auto &projection = child.get().Cast<LogicalProjection>();
+		if (filter_comparison.left->type != ExpressionType::BOUND_COLUMN_REF) {
+			continue;
+		}
+
+		VisitExpression(&filter_comparison.left);
+
+		reference<LogicalOperator> child = *filter.children[0];
+		while (child.get().type == LogicalOperatorType::LOGICAL_PROJECTION) {
+			auto &projection = child.get().Cast<LogicalProjection>();
+			if (column_references.size() != 1) {
+				column_references.clear();
+				continue;
+			}
+
+			const auto current_column_ref = column_references.begin()->first;
+			column_references.clear();
+			D_ASSERT(current_column_ref.table_index == projection.table_index);
+			VisitExpression(&projection.expressions[current_column_ref.column_index]);
+
+			child = *child.get().children[0];
+		}
+
 		if (column_references.size() != 1) {
 			column_references.clear();
-			return false;
+			continue;
 		}
-
-		const auto current_column_ref = column_references.begin()->first;
+		const auto filter_col_idx = column_references.begin()->first.table_index;
 		column_references.clear();
-		D_ASSERT(current_column_ref.table_index == projection.table_index);
-		VisitExpression(&projection.expressions[current_column_ref.column_index]);
 
-		child = *child.get().children[0];
-	}
-
-	if (column_references.size() != 1) {
-		column_references.clear();
-		return false;
-	}
-	const auto filter_col_idx = column_references.begin()->first.table_index;
-	column_references.clear();
-
-	if (child.get().type != LogicalOperatorType::LOGICAL_WINDOW) {
-		return false;
-	}
-	const auto &window = child.get().Cast<LogicalWindow>();
-	if (window.window_index != filter_col_idx) {
-		return false;
-	}
-	if (window.expressions.size() != 1) {
-		for (idx_t i = 1; i < window.expressions.size(); ++i) {
-			if (!window.expressions[i]->Equals(*window.expressions[0])) {
-				return false;
+		if (child.get().type != LogicalOperatorType::LOGICAL_WINDOW) {
+			continue;
+		}
+		const auto &window = child.get().Cast<LogicalWindow>();
+		if (window.window_index != filter_col_idx) {
+			continue;
+		}
+		if (window.expressions.size() != 1) {
+			for (idx_t i = 1; i < window.expressions.size(); ++i) {
+				if (!window.expressions[i]->Equals(*window.expressions[0])) {
+					continue;
+				}
 			}
 		}
-	}
-	if (window.expressions[0]->type != ExpressionType::WINDOW_ROW_NUMBER) {
-		return false;
-	}
-	auto &window_expr = window.expressions[0]->Cast<BoundWindowExpression>();
+		if (window.expressions[0]->type != ExpressionType::WINDOW_ROW_NUMBER) {
+			continue;
+		}
+		auto &window_expr = window.expressions[0]->Cast<BoundWindowExpression>();
 
-	if (window_expr.orders.size() != 1) {
-		return false;
-	}
-	if (window_expr.orders[0].type != OrderType::DESCENDING && window_expr.orders[0].type != OrderType::ASCENDING) {
-		return false;
-	}
-	if (window_expr.orders[0].null_order != OrderByNullType::NULLS_LAST) {
-		return false;
+		if (window_expr.orders.size() != 1) {
+			continue;
+		}
+		if (window_expr.orders[0].type != OrderType::DESCENDING && window_expr.orders[0].type != OrderType::ASCENDING) {
+			continue;
+		}
+		if (window_expr.orders[0].null_order != OrderByNullType::NULLS_LAST) {
+			continue;
+		}
+		return true;
 	}
 
 	// We have found a grouped top-n window construct!
-	return true;
+	return false;
 }
 
 vector<unique_ptr<Expression>> TopNWindowElimination::GenerateAggregatePayload(const vector<ColumnBinding> &bindings,
@@ -665,15 +706,22 @@ void TopNWindowElimination::UpdateTopmostBindings(const idx_t window_idx, const 
 	}
 }
 
-TopNWindowEliminationParameters
-TopNWindowElimination::ExtractOptimizerParameters(const LogicalWindow &window, const LogicalFilter &filter,
-                                                  const vector<ColumnBinding> &bindings,
-                                                  vector<unique_ptr<Expression>> &aggregate_payload) {
+TopNWindowEliminationParameters TopNWindowElimination::ExtractOptimizerParameters(
+    const LogicalWindow &window, LogicalFilter &filter, const vector<ColumnBinding> &bindings,
+    vector<unique_ptr<Expression>> &aggregate_payload, const idx_t &expr_idx, bool &modify_filter) {
 	TopNWindowEliminationParameters params;
 
-	auto &limit_expr = filter.expressions[0]->Cast<BoundComparisonExpression>().right;
-	params.limit = limit_expr->Cast<BoundConstantExpression>().value.GetValue<int64_t>();
-	params.include_row_number = BindingsReferenceRowNumber(bindings, window);
+	auto &limit_expr = filter.expressions[expr_idx]->Cast<BoundComparisonExpression>().right;
+	int64_t limit = limit_expr->Cast<BoundConstantExpression>().value.GetValue<int64_t>();
+	limit = limit < 0 ? 0 : limit;
+	if (limit_expr->type == ExpressionType::COMPARE_LESSTHAN) {
+		limit -= 1;
+	}
+	if (filter.expressions[expr_idx]->type != ExpressionType::COMPARE_EQUAL || limit == 1) {
+		filter.expressions[expr_idx] = make_uniq<BoundConstantExpression>(Value::BOOLEAN(true));
+		modify_filter = true;
+	}
+	params.limit = limit;
 	params.payload_type = aggregate_payload.size() > 1 ? TopNPayloadType::STRUCT_PACK : TopNPayloadType::SINGLE_COLUMN;
 	auto &window_expr = window.expressions[0]->Cast<BoundWindowExpression>();
 	params.order_type = window_expr.orders[0].type;
