@@ -140,16 +140,27 @@ unique_ptr<LogicalOperator> TopNWindowElimination::Optimize(unique_ptr<LogicalOp
 	}
 	FilterPushdown filter_pushdown(optimizer);
 	op = filter_pushdown.Rewrite(std::move(std::move(op)));
-	StatisticsPropagator propagator(optimizer, *op);
-	propagator.PropagateStatistics(op);
-	*stats = propagator.GetStatisticsMap();
 	return op;
 }
 
-vector<ColumnBinding> TopNWindowElimination::GetFilterColumnBindings(LogicalFilter &filter) {
+vector<ColumnBinding> TopNWindowElimination::GetFilterColumnBindings(LogicalFilter &filter, const idx_t &expr_idx) {
 	auto bindings = filter.GetColumnBindings();
-	LogicalOperatorVisitor::EnumerateExpressions(filter, [&](unique_ptr<Expression> *expr) {
-		ExpressionIterator::EnumerateExpression(*expr, [&](unique_ptr<Expression> &child) {
+
+	for (idx_t i = 0; i < filter.expressions.size(); i++) {
+		// Predicates such as rn = 1, rn < N, and rn <= N can be removed later, so can be skipped.
+		if (i == expr_idx) {
+			auto &limit_expr = filter.expressions[expr_idx]->Cast<BoundComparisonExpression>().right;
+			int64_t limit = limit_expr->Cast<BoundConstantExpression>().value.GetValue<int64_t>();
+			limit = limit < 0 ? 0 : limit;
+			if (limit_expr->type == ExpressionType::COMPARE_LESSTHAN) {
+				limit -= 1;
+			}
+			if (filter.expressions[expr_idx]->type != ExpressionType::COMPARE_EQUAL || limit == 1) {
+				continue;
+			}
+		}
+
+		ExpressionIterator::EnumerateExpression(filter.expressions[i], [&](unique_ptr<Expression> &child) {
 			if (child->type == ExpressionType::BOUND_COLUMN_REF) {
 				auto &column_ref = child->Cast<BoundColumnRefExpression>();
 				bool found = false;
@@ -163,7 +174,7 @@ vector<ColumnBinding> TopNWindowElimination::GetFilterColumnBindings(LogicalFilt
 				}
 			}
 		});
-	});
+	}
 
 	return bindings;
 }
@@ -199,7 +210,7 @@ unique_ptr<LogicalOperator> TopNWindowElimination::OptimizeInternal(unique_ptr<L
 	reference<LogicalOperator> child = *filter.children[0];
 
 	// Get bindings and types from filter to use in top-most operator later
-	auto topmost_bindings = GetFilterColumnBindings(filter);
+	auto topmost_bindings = GetFilterColumnBindings(filter, expr_idx);
 	auto new_bindings = TraverseProjectionBindings(topmost_bindings, child);
 
 	D_ASSERT(child.get().type == LogicalOperatorType::LOGICAL_WINDOW);
@@ -211,13 +222,11 @@ unique_ptr<LogicalOperator> TopNWindowElimination::OptimizeInternal(unique_ptr<L
 	map<idx_t, idx_t> group_projection_idxs;
 	auto aggregate_payload = GenerateAggregatePayload(new_bindings, window, group_projection_idxs);
 
-	bool modify_filter = false;
-	auto params = ExtractOptimizerParameters(window, filter, new_bindings, aggregate_payload, expr_idx, modify_filter);
+	auto params = ExtractOptimizerParameters(window, filter, new_bindings, aggregate_payload, expr_idx);
 
 	if (params.limit <= 0) {
 		return make_uniq<LogicalEmptyResult>(std::move(op));
 	}
-	params.include_row_number = true;
 
 	unique_ptr<LogicalOperator> late_mat_lhs = nullptr;
 	if (params.payload_type == TopNPayloadType::STRUCT_PACK) {
@@ -708,19 +717,20 @@ void TopNWindowElimination::UpdateTopmostBindings(const idx_t window_idx, const 
 
 TopNWindowEliminationParameters TopNWindowElimination::ExtractOptimizerParameters(
     const LogicalWindow &window, LogicalFilter &filter, const vector<ColumnBinding> &bindings,
-    vector<unique_ptr<Expression>> &aggregate_payload, const idx_t &expr_idx, bool &modify_filter) {
+    vector<unique_ptr<Expression>> &aggregate_payload, const idx_t &expr_idx) {
 	TopNWindowEliminationParameters params;
 
 	auto &limit_expr = filter.expressions[expr_idx]->Cast<BoundComparisonExpression>().right;
 	int64_t limit = limit_expr->Cast<BoundConstantExpression>().value.GetValue<int64_t>();
 	limit = limit < 0 ? 0 : limit;
-	if (limit_expr->type == ExpressionType::COMPARE_LESSTHAN) {
+	if (filter.expressions[expr_idx]->type == ExpressionType::COMPARE_LESSTHAN) {
 		limit -= 1;
 	}
+	// Predicates such as rn = 1, rn < N, and rn <= N can be removed.
 	if (filter.expressions[expr_idx]->type != ExpressionType::COMPARE_EQUAL || limit == 1) {
 		filter.expressions[expr_idx] = make_uniq<BoundConstantExpression>(Value::BOOLEAN(true));
-		modify_filter = true;
 	}
+	params.include_row_number = BindingsReferenceRowNumber(bindings, window);
 	params.limit = limit;
 	params.payload_type = aggregate_payload.size() > 1 ? TopNPayloadType::STRUCT_PACK : TopNPayloadType::SINGLE_COLUMN;
 	auto &window_expr = window.expressions[0]->Cast<BoundWindowExpression>();

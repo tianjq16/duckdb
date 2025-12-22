@@ -40,13 +40,11 @@ private:
 	bool CanOptimize(LogicalOperator &op, idx_t &expr_idx);
 	unique_ptr<LogicalOperator> OptimizeInternal(unique_ptr<LogicalOperator> op, ColumnBindingReplacer &replacer);
 
-	vector<ColumnBinding> GetFilterColumnBindings(LogicalFilter &filter);
+	vector<ColumnBinding> GetFilterColumnBindings(LogicalFilter &filter, const idx_t &expr_idx);
 
 	unique_ptr<LogicalOperator> CreateAggregateOperator(LogicalWindow &window, vector<unique_ptr<Expression>> args,
 	                                                    const TopNWindowEliminationParameters &params) const;
 	unique_ptr<LogicalOperator> TryCreateUnnestOperator(unique_ptr<LogicalOperator> op,
-	                                                    const TopNWindowEliminationParameters &params) const;
-	unique_ptr<LogicalOperator> TryCreateFilterOperator(unique_ptr<LogicalOperator> op,
 	                                                    const TopNWindowEliminationParameters &params) const;
 	unique_ptr<LogicalOperator> CreateProjectionOperator(unique_ptr<LogicalOperator> op,
 	                                                     const TopNWindowEliminationParameters &params,
@@ -68,7 +66,7 @@ private:
 	TopNWindowEliminationParameters ExtractOptimizerParameters(const LogicalWindow &window, LogicalFilter &filter,
 	                                                           const vector<ColumnBinding> &bindings,
 	                                                           vector<unique_ptr<Expression>> &aggregate_payload,
-	                                                           const idx_t &expr_idx, bool &modify_filter);
+	                                                           const idx_t &expr_idx);
 
 	// Semi-join reduction methods
 	unique_ptr<LogicalOperator> TryPrepareLateMaterialization(const LogicalWindow &window,
