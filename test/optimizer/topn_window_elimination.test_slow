@@ -18,9 +18,9 @@ statement ok
 CREATE TABLE tbl2 AS SELECT * FROM VALUES (0, 'a'), (1, 'b'), (null, 'c'), t(x, y)
 
 statement ok
-CREATE MACRO window_fun(table_name, col_names, sort_order, topn) AS TABLE
+CREATE MACRO window_fun(table_name, col_names, sort_order, predicate) AS TABLE
 FROM query(
-	'SELECT * FROM (SELECT row_number() OVER (PARTITION BY grp ORDER BY b ' || sort_order || ') as rn, ' || array_to_string(col_names, ',') || ' FROM ' || table_name || ' QUALIFY rn <= ' || topn || ') ORDER BY ALL'
+	'SELECT * FROM (SELECT row_number() OVER (PARTITION BY grp ORDER BY b ' || sort_order || ') as rn, ' || array_to_string(col_names, ',') || ' FROM ' || table_name || ' QUALIFY ' || predicate || ') ORDER BY ALL'
 )
 
 statement ok
