@@ -66,6 +66,9 @@ unique_ptr<LogicalOperator> FilterPushdown::PushdownGet(unique_ptr<LogicalOperat
 	}
 	// for any filters we did not manage to push into specialized table filters - try to push them as a generic
 	// expression
+	// Track whether all predecessors have been pushed down.
+	// A CanThrow expression can be pushed down only if all its predecessors are already pushed.
+	bool all_predecessors_pushed = true;
 	for (idx_t i = 0; i < filters.size(); ++i) {
 		// get the previous pushdown result
 		auto pushdown_result = pushdown_results[i];
@@ -75,12 +78,14 @@ unique_ptr<LogicalOperator> FilterPushdown::PushdownGet(unique_ptr<LogicalOperat
 		}
 		auto &expr = *filters[i]->filter;
 		if (expr.IsVolatile()) {
+			all_predecessors_pushed = false;
 			continue;
 		}
-		// Allow pushing down filters that can throw only if there is a single expression
-		// For now, do not push down single expressions with IN either. Later we can change InClauseRewriter to handle
-		// this case
-		if (expr.CanThrow() && (expr.type == ExpressionType::COMPARE_IN || filters.size() > 1)) {
+		// For now, do not push down IN expressions that can throw.
+		// Later we can change InClauseRewriter to handle this case.
+		// For other CanThrow expressions, allow pushdown only if all predecessors have been pushed.
+		if (expr.CanThrow() && (expr.type == ExpressionType::COMPARE_IN || !all_predecessors_pushed)) {
+			all_predecessors_pushed = false;
 			continue;
 		}
 		pushdown_result = combiner.TryPushdownGenericExpression(get, expr);
@@ -88,6 +93,8 @@ unique_ptr<LogicalOperator> FilterPushdown::PushdownGet(unique_ptr<LogicalOperat
 			filters.erase_at(i);
 			pushdown_results.erase_at(i);
 			i--;
+		} else {
+			all_predecessors_pushed = false;
 		}
 	}
 

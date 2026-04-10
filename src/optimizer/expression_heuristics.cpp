@@ -3,7 +3,11 @@
 #include "duckdb/planner/expression/list.hpp"
 #include "duckdb/planner/filter/conjunction_filter.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
+#include "duckdb/planner/filter/expression_filter.hpp"
+#include "duckdb/planner/filter/optional_filter.hpp"
 #include "duckdb/planner/filter/struct_filter.hpp"
+
+#include <set>
 
 namespace duckdb {
 
@@ -35,34 +39,83 @@ void ExpressionHeuristics::ReorderExpressions(vector<unique_ptr<Expression>> &ex
 	struct ExpressionCosts {
 		unique_ptr<Expression> expr;
 		idx_t cost;
+		idx_t original_index;
 
 		bool operator==(const ExpressionCosts &p) const {
 			return cost == p.cost;
 		}
 		bool operator<(const ExpressionCosts &p) const {
-			return cost < p.cost;
+			if (cost != p.cost) {
+				return cost < p.cost;
+			}
+			return original_index < p.original_index;
 		}
 	};
 
-	for (idx_t i = 0; i < expressions.size(); i++) {
-		if (expressions[i]->CanThrow()) {
-			// do not allow reordering if an expression can throw
-			return;
+	idx_t num_expressions = expressions.size();
+
+	// Build all ExpressionCosts upfront; non-throwing go into the candidate set,
+	// throwing expressions go into a separate vector (preserving original order).
+	// Expressions are moved into ExpressionCosts, no separate temp storage needed.
+	std::set<ExpressionCosts> candidates;
+	vector<ExpressionCosts> can_throw_exprs;
+	for (idx_t i = 0; i < num_expressions; i++) {
+		idx_t cost = Cost(*expressions[i]);
+		bool can_throw = expressions[i]->CanThrow();
+		ExpressionCosts entry {std::move(expressions[i]), cost, i};
+		if (can_throw) {
+			can_throw_exprs.push_back(std::move(entry));
+		} else {
+			candidates.insert(std::move(entry));
 		}
 	}
 
-	vector<ExpressionCosts> expression_costs;
-	expression_costs.reserve(expressions.size());
-	// iterate expressions, get cost for each one
-	for (idx_t i = 0; i < expressions.size(); i++) {
-		idx_t cost = Cost(*expressions[i]);
-		expression_costs.push_back({std::move(expressions[i]), cost});
+	if (can_throw_exprs.empty()) {
+		// Fast path: no throwing expressions, extract in ascending cost order
+		idx_t output_idx = 0;
+		while (!candidates.empty()) {
+			auto node = candidates.extract(candidates.begin());
+			expressions[output_idx++] = std::move(node.value().expr);
+		}
+		return;
 	}
 
-	// sort by cost and put back in place
-	sort(expression_costs.begin(), expression_costs.end());
-	for (idx_t i = 0; i < expression_costs.size(); i++) {
-		expressions[i] = std::move(expression_costs[i].expr);
+	// is_placed[i]: whether the expression originally at position i has been written to the output
+	vector<bool> is_placed(num_expressions, false);
+	// all_placed_before: all expressions at original positions 0..all_placed_before-1 have been placed
+	idx_t all_placed_before = 0;
+	// next_throw_idx: index into can_throw_exprs[], the next throwing expression to consider
+	idx_t next_throw_idx = 0;
+	idx_t output_idx = 0;
+
+	// Add the first throwing expression to candidates if it has no predecessors
+	if (next_throw_idx < can_throw_exprs.size() &&
+	    all_placed_before >= can_throw_exprs[next_throw_idx].original_index) {
+		candidates.insert(std::move(can_throw_exprs[next_throw_idx]));
+		next_throw_idx++;
+	}
+
+	while (!candidates.empty()) {
+		// Extract the cheapest expression from candidates
+		auto node = candidates.extract(candidates.begin());
+		auto &cheapest = node.value();
+
+		// Write it to the output
+		idx_t orig_idx = cheapest.original_index;
+		expressions[output_idx++] = std::move(cheapest.expr);
+		is_placed[orig_idx] = true;
+
+		// Advance all_placed_before past all consecutively placed positions
+		while (all_placed_before < num_expressions && is_placed[all_placed_before]) {
+			all_placed_before++;
+		}
+
+		// Add the next throwing expression if all its original predecessors have been placed
+		if (next_throw_idx < can_throw_exprs.size() &&
+		    all_placed_before >= can_throw_exprs[next_throw_idx].original_index) {
+			candidates.insert(std::move(can_throw_exprs[next_throw_idx]));
+			next_throw_idx++;
+		}
 	}
 }
 
@@ -259,33 +312,123 @@ idx_t ExpressionHeuristics::Cost(const TableFilter &filter) {
 	}
 }
 
+static bool FilterCanThrow(const TableFilter &filter) {
+	switch (filter.filter_type) {
+	case TableFilterType::EXPRESSION_FILTER: {
+		auto &expr_filter = filter.Cast<ExpressionFilter>();
+		return expr_filter.expr->CanThrow();
+	}
+	case TableFilterType::CONJUNCTION_OR: {
+		auto &conj = filter.Cast<ConjunctionOrFilter>();
+		for (auto &child : conj.child_filters) {
+			if (FilterCanThrow(*child)) {
+				return true;
+			}
+		}
+		return false;
+	}
+	case TableFilterType::CONJUNCTION_AND: {
+		auto &conj = filter.Cast<ConjunctionAndFilter>();
+		for (auto &child : conj.child_filters) {
+			if (FilterCanThrow(*child)) {
+				return true;
+			}
+		}
+		return false;
+	}
+	case TableFilterType::STRUCT_EXTRACT: {
+		auto &struct_filter = filter.Cast<StructFilter>();
+		return FilterCanThrow(*struct_filter.child_filter);
+	}
+	case TableFilterType::OPTIONAL_FILTER: {
+		auto &optional_filter = filter.Cast<OptionalFilter>();
+		if (optional_filter.child_filter) {
+			return FilterCanThrow(*optional_filter.child_filter);
+		}
+		return false;
+	}
+	default:
+		return false;
+	}
+}
+
 vector<idx_t> ExpressionHeuristics::GetInitialOrder(const TableFilterSet &table_filters) {
 	struct FilterCost {
 		idx_t index;
 		idx_t cost;
 
-		bool operator==(const FilterCost &p) const {
-			return cost == p.cost;
-		}
-		bool operator<(const FilterCost &p) const {
-			return cost < p.cost;
+		bool operator<(const FilterCost &other) const {
+			if (cost != other.cost) {
+				return cost < other.cost;
+			}
+			return index < other.index;
 		}
 	};
-	vector<FilterCost> filter_costs;
+
+	idx_t num_filters = table_filters.filters.size();
+
+	// Build FilterCost entries; non-throwing go into the candidate set,
+	// throwing filters go into a separate vector (preserving original order).
+	std::set<FilterCost> candidates;
+	vector<FilterCost> can_throw_filters;
 	idx_t filter_index = 0;
 	for (auto &entry : table_filters.filters) {
-		FilterCost cost;
-		cost.index = filter_index;
-		cost.cost = Cost(*entry.second);
-		filter_costs.push_back(cost);
+		FilterCost fc {filter_index, Cost(*entry.second)};
+		if (FilterCanThrow(*entry.second)) {
+			can_throw_filters.push_back(fc);
+		} else {
+			candidates.insert(fc);
+		}
 		filter_index++;
 	}
-	// sort by cost and put back in place
-	sort(filter_costs.begin(), filter_costs.end());
-	vector<idx_t> initial_permutation;
-	for (idx_t i = 0; i < filter_costs.size(); i++) {
-		initial_permutation.push_back(filter_costs[i].index);
+
+	if (can_throw_filters.empty()) {
+		// Fast path: no throwing filters, extract in ascending cost order
+		vector<idx_t> initial_permutation;
+		for (auto &fc : candidates) {
+			initial_permutation.push_back(fc.index);
+		}
+		return initial_permutation;
 	}
+
+	// is_placed[i]: whether the filter originally at position i has been placed
+	vector<bool> is_placed(num_filters, false);
+	// all_placed_before: all filters at original positions 0..all_placed_before-1 have been placed
+	idx_t all_placed_before = 0;
+	// next_throw_idx: index into can_throw_filters[], the next throwing filter to consider
+	idx_t next_throw_idx = 0;
+	vector<idx_t> initial_permutation;
+
+	// Add the first throwing filter to candidates if it has no predecessors
+	if (next_throw_idx < can_throw_filters.size() &&
+	    all_placed_before >= can_throw_filters[next_throw_idx].index) {
+		candidates.insert(can_throw_filters[next_throw_idx]);
+		next_throw_idx++;
+	}
+
+	while (!candidates.empty()) {
+		// Extract the cheapest filter from candidates
+		auto it = candidates.begin();
+		FilterCost cheapest = *it;
+		candidates.erase(it);
+
+		// Place it in the output
+		initial_permutation.push_back(cheapest.index);
+		is_placed[cheapest.index] = true;
+
+		// Advance all_placed_before past all consecutively placed positions
+		while (all_placed_before < num_filters && is_placed[all_placed_before]) {
+			all_placed_before++;
+		}
+
+		// Add the next throwing filter if all its original predecessors have been placed
+		if (next_throw_idx < can_throw_filters.size() &&
+		    all_placed_before >= can_throw_filters[next_throw_idx].index) {
+			candidates.insert(can_throw_filters[next_throw_idx]);
+			next_throw_idx++;
+		}
+	}
+
 	return initial_permutation;
 }
 
